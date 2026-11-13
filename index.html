@@ -2,59 +2,379 @@
 <html lang="ru">
 <head>
 <script>
-/* ===== НАСТРОЙКА: вставьте свои данные из Supabase (Project Settings → API) ===== */
-const SB_URL = 'https://pswrqydsksiwqjulzsox.supabase.co';
-const SB_KEY = 'sb_publishable_T2y9nrbY7gaWUzkDn_lo5A_DONc5Y4O';
-/* ============================================================================== */
-
+/* ==================================================================
+   ОБЛАКО: аккаунты (почта / Google) + личное хранилище каждого игрока
+   Supabase: Auth, таблица profiles (сохранение игры), players (список игроков)
+   ================================================================== */
 (function () {
-  const cache = {};
-  let loaded = false;
-  const headers = { 'apikey': SB_KEY };
+  'use strict';
+  const URL_ = 'https://pswrqydsksiwqjulzsox.supabase.co';
+  const KEY_ = 'sb_publishable_T2y9nrbY7gaWUzkDn_lo5A_DONc5Y4O';
+  const SKEY = 'cloud_session_v1';          // сессия входа (отдельно от данных игры)
+  const PUSH_MS = 2000, HB_MS = 30000, ONLINE_SEC = 90;
 
-  try {
-    const xhr = new XMLHttpRequest();
-    xhr.open('GET', SB_URL + '/rest/v1/world?id=eq.world&select=data', false);
-    xhr.setRequestHeader('apikey', SB_KEY);
-        xhr.send();
-    if (xhr.status === 200) {
-      const rows = JSON.parse(xhr.responseText);
-      Object.assign(cache, (rows[0] && rows[0].data) || {});
-      loaded = true;
-    } else {
-      console.error('Supabase: ошибка загрузки', xhr.status, xhr.responseText);
+  const rawGet = Storage.prototype.getItem, rawSet = Storage.prototype.setItem,
+        rawRem = Storage.prototype.removeItem, rawClear = Storage.prototype.clear;
+  let ls = null; try { ls = window.localStorage; } catch (e) {}
+  const has = Object.prototype.hasOwnProperty;
+  const nowSec = () => Math.floor(Date.now() / 1000);
+
+  /* ---------- сессия ---------- */
+  const sGet = () => { try { return JSON.parse(rawGet.call(ls, SKEY)); } catch (e) { return null; } };
+  const sSet = s => { try { rawSet.call(ls, SKEY, JSON.stringify(s)); } catch (e) {} };
+  const sDel = () => { try { rawRem.call(ls, SKEY); } catch (e) {} };
+
+  function jwt(t) {
+    try {
+      let b = String(t).split('.')[1].replace(/-/g, '+').replace(/_/g, '/');
+      while (b.length % 4) b += '=';
+      const bin = atob(b), bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      return JSON.parse(new TextDecoder().decode(bytes));
+    } catch (e) { return {}; }
+  }
+  function mkSession(at, rt, expIn) {
+    const c = jwt(at);
+    if (!c.sub || !at || !rt) return null;
+    return { at: at, rt: rt, exp: c.exp || (nowSec() + (expIn || 3600)), uid: c.sub, email: c.email || '', meta: c.user_metadata || {} };
+  }
+  function defaultNick(s) {
+    const m = (s && s.meta) || {};
+    let n = m.nickname || m.full_name || m.name || ((s && s.email) ? s.email.split('@')[0] : '') || 'Игрок';
+    return String(n).trim().slice(0, 20) || 'Игрок';
+  }
+
+  /* ---------- синхронный запрос (нужен при старте, пока игра читает данные) ---------- */
+  function xs(method, path, body, token) {
+    const x = new XMLHttpRequest();
+    try {
+      x.open(method, URL_ + path, false);
+      x.setRequestHeader('apikey', KEY_);
+      if (token) x.setRequestHeader('Authorization', 'Bearer ' + token);
+      if (body !== undefined) x.setRequestHeader('Content-Type', 'application/json');
+      x.send(body !== undefined ? JSON.stringify(body) : null);
+    } catch (e) { return { status: 0, json: null }; }
+    let j = null; try { j = JSON.parse(x.responseText); } catch (e) {}
+    return { status: x.status, json: j };
+  }
+  function refreshSync(s) {
+    const r = xs('POST', '/auth/v1/token?grant_type=refresh_token', { refresh_token: s.rt });
+    if (r.status === 200 && r.json && r.json.access_token) {
+      const n = mkSession(r.json.access_token, r.json.refresh_token || s.rt, r.json.expires_in);
+      if (n) { sSet(n); return n; }
     }
-  } catch (e) {
-    console.error('Supabase: не удалось загрузить данные', e);
+    return (r.status === 0 || r.status === 429 || r.status >= 500) ? 'net' : null;
   }
 
-  let timer = null;
-  function push() {
-    if (!loaded) return;
+  /* ---------- возврат после входа через Google / ссылку из письма ---------- */
+  function takeHash() {
+    const h = location.hash || '';
+    if (!/(^#|&)(access_token|error|error_description)=/.test(h)) return null;
+    const p = new URLSearchParams(h.slice(1));
+    try { history.replaceState(null, '', location.pathname + location.search); } catch (e) {}
+    const err = p.get('error_description') || p.get('error');
+    if (err) return { error: err };
+    const s = mkSession(p.get('access_token'), p.get('refresh_token'), +p.get('expires_in'));
+    return s ? { session: s } : null;
+  }
+
+  /* ---------- старт: вход, загрузка данных игрока ---------- */
+  const cache = {};
+  let S = null, loaded = false, isNew = false, state = 'login', bootMsg = '', bootDetail = '', lastJson = '';
+  const cb = takeHash();
+  if (cb && cb.error) bootMsg = cb.error;
+  S = (cb && cb.session) || sGet();
+  if (cb && cb.session) sSet(S);
+  if (S && !(S.at && S.rt && S.uid)) S = null;
+
+  if (S && S.exp - 60 < nowSec()) {
+    const rr = refreshSync(S);
+    if (rr === 'net') state = 'neterror';
+    else if (!rr) { S = null; sDel(); bootMsg = bootMsg || 'Сессия истекла. Войдите снова.'; }
+    else S = rr;
+  }
+  if (S && state !== 'neterror') {
+    const q = '/rest/v1/profiles?select=data&id=eq.' + encodeURIComponent(S.uid);
+    let r = xs('GET', q, undefined, S.at);
+    if (r.status === 401) {
+      const r2 = refreshSync(S);
+      if (r2 === 'net') r = { status: 0 };
+      else if (!r2) { S = null; sDel(); bootMsg = 'Сессия истекла. Войдите снова.'; r = null; }
+      else { S = r2; r = xs('GET', q, undefined, S.at); }
+    }
+    if (S && r) {
+      if (r.status === 200 && Array.isArray(r.json)) {
+        const d = r.json.length ? r.json[0].data : null;
+        if (d && typeof d === 'object') Object.keys(d).forEach(k => { cache[k] = d[k]; });
+        isNew = !r.json.length;
+        loaded = true; state = 'ok'; lastJson = JSON.stringify(cache);
+        if (!cache.sber_nick) cache.sber_nick = defaultNick(S);
+      } else if (r.status === 0 || r.status === 429 || r.status >= 500) state = 'neterror';
+      else { state = 'dberror'; bootDetail = r.status + (r.json && r.json.message ? ': ' + r.json.message : ''); }
+    }
+  }
+
+  /* ---------- подмена localStorage: данные игры живут в облаке, не на устройстве ---------- */
+  const isG = k => typeof k === 'string' && k.indexOf('sber') === 0;
+  Storage.prototype.getItem = function (k) {
+    if (this === ls && isG(k)) return has.call(cache, k) ? cache[k] : null;
+    return rawGet.apply(this, arguments);
+  };
+  Storage.prototype.setItem = function (k, v) {
+    if (this === ls && isG(k)) { cache[k] = String(v); schedule(); return; }
+    return rawSet.apply(this, arguments);
+  };
+  Storage.prototype.removeItem = function (k) {
+    if (this === ls && isG(k)) { delete cache[k]; schedule(); return; }
+    return rawRem.apply(this, arguments);
+  };
+  Storage.prototype.clear = function () {
+    if (this === ls) { Object.keys(cache).forEach(k => { if (isG(k)) delete cache[k]; }); schedule(); return; }
+    return rawClear.apply(this, arguments);
+  };
+
+  /* ---------- сохранение ---------- */
+  let timer = null, pushing = false, lastSaved = null, refreshing = null, retryMs = 8000;
+  const fire = (n, d) => { try { window.dispatchEvent(new CustomEvent(n, { detail: d })); } catch (e) {} };
+  function schedule() { if (!loaded) return; clearTimeout(timer); timer = setTimeout(flush, PUSH_MS); }
+
+  // если другая вкладка уже обновила вход — берём её свежую сессию, а не обновляем второй раз
+  function adoptStored() {
+    const t = sGet();
+    if (S && t && t.uid === S.uid && t.at && t.exp > S.exp) { S = t; return true; }
+    return false;
+  }
+  function refreshAsync() {
+    if (refreshing) return refreshing;
+    if (!S) return Promise.resolve(false);
+    if (adoptStored() && S.exp - 60 >= nowSec()) return Promise.resolve(true);
+    refreshing = fetch(URL_ + '/auth/v1/token?grant_type=refresh_token', {
+      method: 'POST', headers: { apikey: KEY_, 'Content-Type': 'application/json' }, body: JSON.stringify({ refresh_token: S.rt })
+    }).then(r => r.text().then(t => {
+      let j = null; try { j = JSON.parse(t); } catch (e) {}
+      if (r.ok && j && j.access_token) { const n = mkSession(j.access_token, j.refresh_token || S.rt, j.expires_in); if (n) { S = n; sSet(S); return true; } }
+      if (r.status === 400 || r.status === 401 || r.status === 403) { if (adoptStored()) return true; sessionDead(); }
+      return false;
+    })).catch(() => false).then(ok => { refreshing = null; return ok; });
+    return refreshing;
+  }
+  function ensureFresh() { return (S && S.exp - 60 < nowSec()) ? refreshAsync() : Promise.resolve(true); }
+
+  function rest(path, method, bodyStr, extra, keep) {
+    const go = k => {
+      if (!S) return Promise.resolve({ ok: false, status: 401, json: null });
+      const h = { apikey: KEY_, Authorization: 'Bearer ' + S.at, 'Content-Type': 'application/json' };
+      if (extra) Object.keys(extra).forEach(x => { h[x] = extra[x]; });
+      return fetch(URL_ + path, { method: method, headers: h, body: bodyStr, keepalive: !!k })
+        .then(r => r.text().then(t => { let j = null; try { j = t ? JSON.parse(t) : null; } catch (e) {} return { ok: r.ok, status: r.status, json: j }; }));
+    };
+    return ensureFresh().then(() => go(keep).catch(() => (keep ? go(false) : Promise.reject())))
+      .then(res => (res.status === 401 && S) ? refreshAsync().then(ok => ok ? go(false) : res) : res)
+      .catch(() => ({ ok: false, status: 0, json: null }));
+  }
+
+  function flush(keep) {
     clearTimeout(timer);
-    timer = setTimeout(() => {
-      fetch(SB_URL + '/rest/v1/world', {
-        method: 'POST',
-        headers: Object.assign({
-          'Content-Type': 'application/json',
-          'Prefer': 'resolution=merge-duplicates'
-        }, headers),
-        body: JSON.stringify([{ id: 'world', data: cache }])
-      }).then(r => { if (!r.ok) console.error('Supabase: ошибка сохранения', r.status); })
-        .catch(e => console.error('Supabase: сеть недоступна', e));
-    }, 300);
+    if (!loaded || !S) return Promise.resolve(false);
+    const json = JSON.stringify(cache);
+    if (json === lastJson) return Promise.resolve(true);
+    if (pushing) { schedule(); return Promise.resolve(false); }
+    pushing = true;
+    const body = '{"id":' + JSON.stringify(S.uid) + ',"data":' + json + ',"updated_at":' + JSON.stringify(new Date().toISOString()) + '}';
+    return rest('/rest/v1/profiles?on_conflict=id', 'POST', body, { Prefer: 'resolution=merge-duplicates,return=minimal' }, keep === true && body.length < 60000)
+      .then(r => {
+        pushing = false;
+        if (r.ok) { lastJson = json; lastSaved = Date.now(); retryMs = 8000; fire('cloud-saved'); return true; }
+        console.error('Облако: ошибка сохранения', r.status, r.json);
+        fire('cloud-error', r.status);
+        setTimeout(schedule, retryMs); retryMs = Math.min(retryMs * 2, 120000);
+        return false;
+      });
+  }
+  function flushNow() {
+    return new Promise(res => {
+      const t0 = Date.now();
+      (function step() {
+        if (pushing && Date.now() - t0 < 5000) return setTimeout(step, 150);
+        flush().then(res);
+      })();
+    });
+  }
+  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') flush(true); else heartbeat(); });
+  window.addEventListener('pagehide', () => { flush(true); });
+
+  /* ---------- «в сети» и список игроков ---------- */
+  const myNick = () => { const n = cache.sber_nick; return (n && String(n).trim()) || defaultNick(S); };
+  function myLevel() {
+    try { const l = parseInt(getLevel(usersData[currentUserId]), 10); return l > 0 ? Math.min(l, 9999) : 1; } catch (e) { return 1; }
+  }
+  function heartbeat() {
+    if (!loaded || !S || document.visibilityState === 'hidden') return Promise.resolve(false);
+    return rest('/rest/v1/rpc/heartbeat', 'POST', JSON.stringify({ p_name: myNick(), p_level: myLevel() })).then(r => r.ok);
+  }
+  function listPlayers() {
+    return rest('/rest/v1/rpc/list_players', 'POST', '{}').then(r => {
+      if (!r.ok || !Array.isArray(r.json)) return { error: r.status };
+      const rows = r.json.map(p => {
+        const ago = Math.max(0, parseInt(p.ago, 10) || 0);
+        return { id: p.id, name: String(p.name || 'Игрок'), level: parseInt(p.level, 10) || 1, ago: ago, online: ago < ONLINE_SEC, me: !!S && p.id === S.uid };
+      });
+      rows.sort((a, b) => a.online !== b.online ? (a.online ? -1 : 1)
+        : a.online ? a.name.localeCompare(b.name, 'ru') : a.ago - b.ago);
+      return { rows: rows };
+    });
+  }
+  setInterval(heartbeat, HB_MS);
+  window.addEventListener('load', () => setTimeout(heartbeat, 600));
+
+  /* ---------- вход / регистрация ---------- */
+  const aapi = (path, method, body) => fetch(URL_ + path, {
+      method: method || 'GET', headers: { apikey: KEY_, 'Content-Type': 'application/json' }, body: body ? JSON.stringify(body) : undefined })
+    .then(r => r.text().then(t => { let j = null; try { j = t ? JSON.parse(t) : null; } catch (e) {} return { ok: r.ok, status: r.status, json: j }; }))
+    .catch(() => ({ ok: false, status: 0, json: null }));
+
+  function errText(r) {
+    const j = r.json || {}, code = String(j.error_code || j.error || ''), msg = String(j.msg || j.error_description || j.message || '');
+    if (r.status === 0) return 'Нет связи с сервером. Проверьте интернет (если включён VPN — выключите его).';
+    if (code === 'invalid_credentials' || /invalid login credentials/i.test(msg)) return 'Неверная почта или пароль.';
+    if (code === 'email_not_confirmed' || /not confirmed/i.test(msg)) return 'Почта не подтверждена. Откройте письмо со ссылкой.';
+    if (code === 'user_already_exists' || /already (been )?registered/i.test(msg)) return 'Эта почта уже зарегистрирована. Откройте вкладку «Вход».';
+    if (code === 'weak_password' || /password should/i.test(msg)) return 'Слишком слабый пароль: нужно минимум 6 символов.';
+    if (/not authorized/i.test(msg) || code === 'over_email_send_rate_limit') { console.warn('Supabase: письма не отправляются. Отключите Confirm email (Authentication → Sign In / Providers → Email).'); return 'Не удалось отправить письмо подтверждения. Попробуйте позже или войдите через Google.'; }
+    if (code === 'validation_failed' || code === 'email_address_invalid' || /invalid.*email|email.*invalid/i.test(msg)) return 'Проверьте адрес почты.';
+    if (code === 'over_request_rate_limit' || r.status === 429) return 'Слишком много попыток. Подождите немного и повторите.';
+    if (code === 'signup_disabled' || /signups? not allowed|signup.*disabled/i.test(msg)) return 'Регистрация сейчас отключена.';
+    return 'Ошибка ' + r.status + (msg ? ': ' + msg : '');
+  }
+  function signUp(nick, email, pass) {
+    return aapi('/auth/v1/signup', 'POST', { email: email, password: pass, data: { nickname: nick } }).then(r => {
+      if (!r.ok) return { error: errText(r) };
+      const j = r.json || {};
+      if (j.access_token) { const s = mkSession(j.access_token, j.refresh_token, j.expires_in); if (s) { sSet(s); return { ok: true }; } }
+      return { confirm: true };
+    });
+  }
+  function signIn(email, pass) {
+    return aapi('/auth/v1/token?grant_type=password', 'POST', { email: email, password: pass }).then(r => {
+      if (!r.ok || !r.json || !r.json.access_token) return { error: errText(r) };
+      const s = mkSession(r.json.access_token, r.json.refresh_token, r.json.expires_in);
+      if (!s) return { error: 'Не удалось войти. Попробуйте ещё раз.' };
+      sSet(s); return { ok: true };
+    });
+  }
+  const siteUrl = () => location.origin + location.pathname.replace(/index\.html$/, '');
+  const googleLogin = () => { location.href = URL_ + '/auth/v1/authorize?provider=google&redirect_to=' + encodeURIComponent(siteUrl()); };
+  const loadSettings = () => aapi('/auth/v1/settings', 'GET').then(r => ({ google: !!(r.json && r.json.external && r.json.external.google) }));
+
+  function signOut() {
+    const done = () => { sDel(); S = null; loaded = false; location.reload(); };
+    const t = setTimeout(done, 6000);
+    flushNow().then(() => S ? fetch(URL_ + '/auth/v1/logout?scope=local', { method: 'POST', headers: { apikey: KEY_, Authorization: 'Bearer ' + S.at } }).catch(() => {}) : null)
+      .then(() => { clearTimeout(t); done(); });
+  }
+  function sessionDead() { S = null; loaded = false; sDel(); showGate('login', 'Сессия истекла. Войдите снова.', 'err'); }
+
+  /* ---------- окно входа ---------- */
+  const G = { mode: 'login', msg: '', kind: '', busy: false, google: false, email: '' };
+  const CSS = 'html.cl-gate body>*:not(#authGate){visibility:hidden!important}' +
+    '#authGate{position:fixed;top:0;right:0;bottom:0;left:0;z-index:2147483000;background:var(--bg-color,#0f1115);color:var(--text-color,#f0f2f5);overflow:auto;display:flex;padding:24px 16px;box-sizing:border-box}' +
+    '#authGate *{box-sizing:border-box}' +
+    '#authGate .cl-card{width:100%;max-width:400px;margin:auto;background:var(--card-bg,#1a1d24);border:1px solid var(--border-color,#2a2e39);border-radius:20px;padding:22px 18px}' +
+    '#authGate .cl-logo{font-size:24px;font-weight:800;text-align:center}' +
+    '#authGate .cl-sub{font-size:13px;color:var(--text-secondary,#9ba1a8);text-align:center;margin:2px 0 16px}' +
+    '#authGate .cl-tabs{display:flex;gap:6px;background:var(--card-sub-bg,#121419);border-radius:12px;padding:4px;margin-bottom:12px}' +
+    '#authGate .cl-tab{flex:1;border:0;border-radius:9px;padding:9px;font-size:14px;font-weight:700;background:transparent;color:var(--text-secondary,#9ba1a8);cursor:pointer}' +
+    '#authGate .cl-tab.on{background:var(--sber-gradient,linear-gradient(135deg,#21a038,#105a1d));color:#fff}' +
+    '#authGate label{display:block;font-size:12px;font-weight:600;color:var(--text-secondary,#9ba1a8);margin:10px 0 4px}' +
+    '#authGate input{width:100%;padding:12px;font-size:16px;border-radius:12px;border:1px solid var(--border-color,#2a2e39);background:var(--card-sub-bg,#121419);color:var(--text-color,#f0f2f5);outline:none}' +
+    '#authGate input:focus{border-color:var(--sber-green-bright,#28c244)}' +
+    '#authGate .cl-hint{font-size:11px;color:var(--text-secondary,#9ba1a8);margin-top:6px}' +
+    '#authGate .cl-msg{min-height:18px;font-size:13px;margin:12px 0 4px;line-height:1.35}' +
+    '#authGate .cl-msg.err{color:#ef4444}#authGate .cl-msg.ok{color:#22c55e}' +
+    '#authGate .cl-btn{width:100%;margin-top:8px;padding:13px;border:0;border-radius:12px;font-size:15px;font-weight:700;color:#fff;cursor:pointer;background:var(--sber-gradient,linear-gradient(135deg,#21a038,#105a1d))}' +
+    '#authGate .cl-btn:disabled{opacity:.55;cursor:default}' +
+    '#authGate .cl-btn.ghost{background:transparent;border:1px solid var(--border-color,#2a2e39);color:var(--text-color,#f0f2f5)}' +
+    '#authGate .cl-btn.google{background:#fff;color:#1f1f1f;border:1px solid #dadce0}#authGate .cl-btn.google b{color:#4285f4;margin-right:6px}' +
+    '#authGate .cl-or{display:flex;align-items:center;gap:10px;margin:14px 0 4px;font-size:12px;color:var(--text-secondary,#9ba1a8)}' +
+    '#authGate .cl-or:before,#authGate .cl-or:after{content:"";flex:1;height:1px;background:var(--border-color,#2a2e39)}' +
+    '#authGate .cl-note{margin-top:18px;padding-top:12px;border-top:1px solid var(--border-color,#2a2e39);font-size:11px;line-height:1.4;color:var(--text-secondary,#9ba1a8);text-align:center}';
+  const st = document.createElement('style'); st.id = 'clGateCss'; st.textContent = CSS; document.documentElement.appendChild(st);
+
+  const $ = id => document.getElementById(id);
+  function setMsg(t, k) { G.msg = t || ''; G.kind = k || ''; const m = $('clMsg'); if (m) { m.textContent = G.msg; m.className = 'cl-msg ' + G.kind; } }
+  function googleBtn() {
+    if ($('clGoogle') || !$('clGo')) return;
+    const or = document.createElement('div'); or.className = 'cl-or'; or.innerHTML = '<span>или</span>';
+    const b = document.createElement('button'); b.className = 'cl-btn google'; b.id = 'clGoogle'; b.innerHTML = '<b>G</b> Войти через Google';
+    b.onclick = googleLogin;
+    $('clGo').after(or, b);
+  }
+  function submitGate() {
+    if (G.busy) return;
+    const signup = G.mode === 'signup', email = ($('clEmail').value || '').trim(), pass = $('clPass').value || '';
+    G.email = email;
+    let nick = '';
+    if (signup) {
+      nick = ($('clNick').value || '').trim();
+      if (nick.length < 2) return setMsg('Введите ник (минимум 2 символа).', 'err');
+    }
+    if (!/^\S+@\S+\.\S+$/.test(email)) return setMsg('Проверьте адрес почты.', 'err');
+    if (pass.length < 6) return setMsg('Пароль — минимум 6 символов.', 'err');
+    if (signup && pass !== $('clPass2').value) return setMsg('Пароли не совпадают.', 'err');
+    G.busy = true; $('clGo').disabled = true; setMsg('Подождите…', '');
+    (signup ? signUp(nick, email, pass) : signIn(email, pass)).then(r => {
+      G.busy = false; const b = $('clGo'); if (b) b.disabled = false;
+      if (r.error) return setMsg(r.error, 'err');
+      if (r.confirm) return setMsg('Письмо отправлено на ' + email + '. Подтвердите почту по ссылке в письме, затем войдите.', 'ok');
+      location.reload();
+    });
+  }
+  function renderGate() {
+    if (!document.body) return;
+    let g = $('authGate'); if (!g) { g = document.createElement('div'); g.id = 'authGate'; document.body.appendChild(g); }
+    const m = G.mode, signup = m === 'signup', bad = m === 'neterror' || m === 'dberror';
+    let h = '<div class="cl-card"><div class="cl-logo">🟢 СБЕР</div><div class="cl-sub">Игра-симулятор · аккаунт игрока</div>';
+    if (bad) {
+      h += '<div class="cl-msg err" id="clMsg"></div><button class="cl-btn" id="clRetry">Повторить</button><button class="cl-btn ghost" id="clLogout">Выйти из аккаунта</button>';
+    } else {
+      h += '<div class="cl-tabs"><button class="cl-tab' + (signup ? '' : ' on') + '" data-m="login">Вход</button><button class="cl-tab' + (signup ? ' on' : '') + '" data-m="signup">Регистрация</button></div>';
+      if (signup) h += '<label for="clNick">Ник в списке игроков</label><input id="clNick" maxlength="20" autocomplete="nickname" placeholder="Например: Саша">';
+      h += '<label for="clEmail">Почта</label><input id="clEmail" type="email" inputmode="email" autocomplete="email" placeholder="name@mail.ru">';
+      h += '<label for="clPass">Пароль</label><input id="clPass" type="password" autocomplete="' + (signup ? 'new-password' : 'current-password') + '" placeholder="Минимум 6 символов">';
+      if (signup) h += '<label for="clPass2">Повторите пароль</label><input id="clPass2" type="password" autocomplete="new-password"><div class="cl-hint">Придумайте новый пароль — не тот, что от почты, Сбера или других сервисов.</div>';
+      h += '<div class="cl-msg" id="clMsg"></div><button class="cl-btn" id="clGo">' + (signup ? 'Создать аккаунт' : 'Войти') + '</button>';
+    }
+    h += '<div class="cl-note">⚠️ Это учебная игра, а не настоящий банк. Она никак не связана с ПАО «Сбербанк». Не вводите реальные данные карт и не используйте пароли от настоящих сервисов.</div></div>';
+    g.innerHTML = h;
+    setMsg(G.msg, G.kind);
+    if (bad) {
+      $('clRetry').onclick = () => location.reload();
+      $('clLogout').onclick = () => { sDel(); location.reload(); };
+      return;
+    }
+    if ($('clEmail')) $('clEmail').value = G.email;
+    g.querySelectorAll('.cl-tab').forEach(b => { b.onclick = () => { G.email = ($('clEmail').value || '').trim(); G.mode = b.dataset.m; G.msg = ''; renderGate(); }; });
+    $('clGo').onclick = submitGate;
+    g.onkeydown = e => { if (e.key === 'Enter' && $('clGo')) { e.preventDefault(); submitGate(); } };
+    if (G.google) googleBtn();
+  }
+  function showGate(mode, msg, kind) {
+    G.mode = mode || 'login'; G.msg = msg || ''; G.kind = kind || '';
+    document.documentElement.classList.add('cl-gate');
+    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', renderGate); else renderGate();
   }
 
-  Storage.prototype.getItem = function (key) {
-    return Object.prototype.hasOwnProperty.call(cache, key) ? cache[key] : null;
-  };
-  Storage.prototype.setItem = function (key, value) {
-    cache[key] = String(value);
-    push();
-  };
-  Storage.prototype.removeItem = function (key) {
-    delete cache[key];
-    push();
+  if (state !== 'ok') {
+    if (state === 'neterror') showGate('neterror', 'Не удалось связаться с сервером. Проверьте интернет (если включён VPN — выключите его) и нажмите «Повторить».', 'err');
+    else if (state === 'dberror') showGate('dberror', 'База данных не готова (' + bootDetail + '). Выполните SQL-шаги из инструкции и нажмите «Повторить».', 'err');
+    else showGate('login', bootMsg, bootMsg ? 'err' : '');
+    if (state === 'login') loadSettings().then(s => { G.google = s.google; if (s.google) googleBtn(); });
+  }
+
+  window.Cloud = {
+    ready: () => loaded, isNew: () => isNew, email: () => (S ? S.email : ''), nick: myNick,
+    setNick: n => { n = String(n || '').trim().slice(0, 20); if (n.length < 2) return false; localStorage.setItem('sber_nick', n); heartbeat(); return true; },
+    lastSaved: () => lastSaved, flush: flushNow, signOut: signOut, heartbeat: heartbeat, listPlayers: listPlayers
   };
 })();
 </script>
@@ -457,7 +777,7 @@ body.no-anim *, body.no-anim *::before, body.no-anim *::after { animation: none 
     <div id="lockScreen">
         <div style="font-size: 42px; margin-bottom: 10px;">🔒</div>
         <h2 style="font-size: 20px; margin-bottom: 6px;">Введите ПИН-код</h2>
-        <p style="font-size: 13px; color: var(--text-secondary); margin-bottom: 8px;">По умолчанию: 0000</p>
+        <p style="font-size: 13px; color: var(--text-secondary); margin-bottom: 8px;" id="pinHint">По умолчанию: 0000</p>
         <div class="pin-status" id="pinStatus"></div>
         <div class="pin-dots">
             <div class="pin-dot" id="pd-0"></div>
@@ -475,7 +795,7 @@ body.no-anim *, body.no-anim *::before, body.no-anim *::after { animation: none 
             <button class="pin-btn" onclick="pressPin('7')">7</button>
             <button class="pin-btn" onclick="pressPin('8')">8</button>
             <button class="pin-btn" onclick="pressPin('9')">9</button>
-            <button class="pin-btn" onclick="pressPin('bio')" style="font-size: 18px;">👆</button>
+            <div aria-hidden="true"></div>
             <button class="pin-btn" onclick="pressPin('0')">0</button>
             <button class="pin-btn" onclick="pressPin('del')" style="font-size: 18px;">⌫</button>
         </div>
@@ -1310,7 +1630,8 @@ body.no-anim *, body.no-anim *::before, body.no-anim *::after { animation: none 
 
         let currentPinInput = "";
         let adminPassword = localStorage.getItem('sber_v9_admin_pass') || "5987";
-        let correctPin = localStorage.getItem('sber_v9_pin') || "0000";
+        // ПИН-код хранится у каждого профиля отдельно (usersData[id].pin), по умолчанию 0000
+        function userPin() { const u = usersData[currentUserId]; return (u && u.pin) ? String(u.pin) : "0000"; }
 
         function saveData() {
             localStorage.setItem('sber_v9_users', JSON.stringify(usersData));
@@ -1362,11 +1683,7 @@ body.no-anim *, body.no-anim *::before, body.no-anim *::after { animation: none 
 
         function pressPin(val) {
             if (isPinLocked()) { updatePinStatus(); return; }
-            if (val === 'bio') {
-                showPush("Биометрия", "Успешный вход по отпечатку пальца!");
-                unlockApp();
-                return;
-            }
+            if (!/^\d$/.test(val) && val !== 'del') return;
             if (val === 'del') {
                 currentPinInput = currentPinInput.slice(0, -1);
             } else if (currentPinInput.length < 4) {
@@ -1380,7 +1697,7 @@ body.no-anim *, body.no-anim *::before, body.no-anim *::after { animation: none 
             }
 
             if (currentPinInput.length === 4) {
-                if (currentPinInput === correctPin) {
+                if (currentPinInput === userPin()) {
                     resetPinFails();
                     showPush("Безопасность", "Вход выполнен успешно");
                     unlockApp();
@@ -1397,11 +1714,11 @@ body.no-anim *, body.no-anim *::before, body.no-anim *::after { animation: none 
             const oldP = document.getElementById('pinOldInput').value;
             const newP = document.getElementById('pinNewInput').value;
             const confP = document.getElementById('pinConfirmInput').value;
-            if (oldP !== correctPin) return showToast("Текущий ПИН-код неверный!");
+            if (oldP !== userPin()) return showToast("Текущий ПИН-код неверный!");
             if (!/^\d{4}$/.test(newP)) return showToast("ПИН-код должен состоять из 4 цифр!");
             if (newP !== confP) return showToast("ПИН-коды не совпадают!");
-            correctPin = newP;
-            localStorage.setItem('sber_v9_pin', newP);
+            usersData[currentUserId].pin = newP;
+            saveData();
             ['pinOldInput', 'pinNewInput', 'pinConfirmInput'].forEach(id => document.getElementById(id).value = '');
             showToast("ПИН-код изменён!");
             showPush("Безопасность", "ПИН-код для входа успешно изменён");
@@ -4418,6 +4735,100 @@ function mount() {
     if (b) { b.insertAdjacentHTML('beforeend', `<div class="xq" id="xPrAdm" style="margin-top:16px"><div class="box-title">🎟️ Промокоды</div><input id="paC" placeholder="Код (SBER2026)"><select id="paK"><option value="cash">Стартовый капитал, ₽</option><option value="luck">Буст удачи, % на 30 мин</option><option value="xp">XP</option><option value="sp">Спасибо</option></select><input id="paV" type="number" placeholder="Значение"><input id="paM" type="number" placeholder="Макс. активаций (0 — без лимита)"><button class="btn" onclick="xPrAdd()">Создать код</button><div id="paL"></div></div>`); admList(); }
 }
 mount(); setInterval(() => { const u = cu(); if (u) { if (scoreTick()) saveData(); gigBox(u); } }, 1000); setTimeout(() => { try { updateUI(); } catch (e) {} }, 0);
+})();
+</script>
+
+
+<style id="clUiCss">
+nav .nav-item { width: auto; flex: 1 1 0; min-width: 0; padding: 0 1px; }
+.cl-sum { font-size: 13px; color: var(--text-secondary); margin: 2px 0 6px; }
+.cl-grp { font-size: 12px; font-weight: 700; color: var(--text-secondary); text-transform: uppercase; letter-spacing: .04em; margin: 14px 2px 6px; }
+.cl-row { display: flex; align-items: center; gap: 12px; padding: 10px 12px; margin: 6px 0; border-radius: 14px; background: var(--card-sub-bg); border: 1px solid var(--border-color); }
+.cl-av { width: 40px; height: 40px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 16px; color: #fff; background: #6b7280; flex: none; position: relative; }
+.cl-av.on { background: var(--sber-gradient); }
+.cl-av.on::after { content: ''; position: absolute; right: -1px; bottom: -1px; width: 12px; height: 12px; border-radius: 50%; background: #22c55e; border: 2px solid var(--card-sub-bg); }
+.cl-main { flex: 1; min-width: 0; }
+.cl-name { font-weight: 700; font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.cl-me { margin-left: 6px; font-size: 10px; font-weight: 700; padding: 2px 6px; border-radius: 8px; background: var(--sber-green-bright); color: #fff; vertical-align: middle; }
+.cl-subt { font-size: 12px; color: var(--text-secondary); }
+.cl-st { font-size: 12px; color: var(--text-secondary); white-space: nowrap; text-align: right; }
+.cl-st.on { color: #22c55e; font-weight: 700; }
+.cl-foot { font-size: 11px; color: var(--text-secondary); margin-top: 12px; text-align: center; }
+.cl-acc-mail { font-size: 13px; color: var(--text-secondary); margin-bottom: 12px; word-break: break-all; }
+.cl-saved { font-size: 12px; color: var(--text-secondary); margin: 8px 0 4px; }
+</style>
+<script>
+/* ===== Аккаунт игрока: список игроков, выход, личный ПИН ===== */
+(function () {
+  'use strict';
+  const C = window.Cloud;
+  if (!C || !C.ready()) return;
+  const $ = id => document.getElementById(id);
+  const mk = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; };
+
+  /* 1. Новый игрок: его первый профиль называется по его нику */
+  try {
+    if (C.isNew() && usersData.user1) { usersData.user1.name = C.nick(); saveData(); renderUserSelector(); updateUI(); }
+  } catch (e) { console.warn(e); }
+
+  /* 2. ПИН у каждого профиля свой: подсказку «0000» показываем только если ПИН не менялся */
+  function pinHint() { const h = $('pinHint'), u = usersData[currentUserId]; if (h) h.style.display = (u && u.pin) ? 'none' : ''; }
+  const _su = switchUser; switchUser = function () { const r = _su.apply(this, arguments); pinHint(); return r; };
+  const _cp = changePin; changePin = function () { const r = _cp.apply(this, arguments); pinHint(); return r; };
+  pinHint();
+
+  /* 3. Вкладка «Игроки» — слева от «Настроек» */
+  const tab = mk('div', 'tab-content'); tab.id = 'tab-players';
+  tab.innerHTML = '<div class="box"><div class="box-title">👥 Список игроков</div><div class="cl-sum" id="plSum">Загрузка…</div><div id="plList"></div>' +
+    '<div class="cl-foot">Обновляется автоматически. «В сети» — игрок открыл игру прямо сейчас.</div></div>';
+  $('tab-settings').before(tab);
+  const nb = mk('button', 'nav-item'); nb.dataset.tab = 'players'; nb.setAttribute('onclick', "switchTab('players',this)");
+  nb.innerHTML = '<span class="nav-icon">👥</span><span>Игроки</span>';
+  document.querySelector('nav .nav-item[data-tab="settings"]').before(nb);
+
+  const agoText = s => s < 3600 ? Math.max(1, Math.floor(s / 60)) + ' мин назад' : s < 86400 ? Math.floor(s / 3600) + ' ч назад' : Math.floor(s / 86400) + ' дн. назад';
+  function row(p) {
+    const d = mk('div', 'cl-row'), av = mk('div', 'cl-av' + (p.online ? ' on' : ''), (p.name.trim().charAt(0) || '?').toUpperCase());
+    const m = mk('div', 'cl-main'), nm = mk('div', 'cl-name', p.name);
+    if (p.me) nm.appendChild(mk('span', 'cl-me', 'вы'));
+    m.appendChild(nm); m.appendChild(mk('div', 'cl-subt', 'Уровень ' + p.level));
+    d.appendChild(av); d.appendChild(m); d.appendChild(mk('div', 'cl-st' + (p.online ? ' on' : ''), p.online ? '● В сети' : agoText(p.ago)));
+    return d;
+  }
+  function render(res) {
+    const list = $('plList'), sum = $('plSum'); list.textContent = '';
+    if (res.error != null) {
+      sum.textContent = (res.error === 404 || res.error === 400) ? 'Список игроков ещё не настроен в базе (выполните SQL из инструкции).' : 'Не удалось загрузить список (код ' + res.error + ').';
+      return;
+    }
+    const on = res.rows.filter(p => p.online), off = res.rows.filter(p => !p.online);
+    sum.textContent = 'В сети: ' + on.length + ' · Не в сети: ' + off.length;
+    if (on.length) { list.appendChild(mk('div', 'cl-grp', 'В сети · ' + on.length)); on.forEach(p => list.appendChild(row(p))); }
+    if (off.length) { list.appendChild(mk('div', 'cl-grp', 'Не в сети · ' + off.length)); off.forEach(p => list.appendChild(row(p))); }
+  }
+  let plBusy = false;
+  function refreshPlayers() {
+    if (plBusy) return; plBusy = true;
+    C.heartbeat().then(() => C.listPlayers()).then(render).then(() => { plBusy = false; }, () => { plBusy = false; });
+  }
+  nb.addEventListener('click', refreshPlayers);
+  setInterval(() => { if (tab.classList.contains('active') && document.visibilityState === 'visible') refreshPlayers(); }, 15000);
+
+  /* 4. Блок «Аккаунт» вверху настроек */
+  const set = $('tab-settings'), box = mk('div', 'box'); box.id = 'clAccount';
+  box.innerHTML = '<div class="box-title">👤 Аккаунт</div><div class="cl-acc-mail" id="clAccMail"></div>' +
+    '<label>Ник в списке игроков</label><input type="text" id="clNickInp" maxlength="20" placeholder="Ваш ник">' +
+    '<button class="btn" id="clNickBtn" style="margin-top:8px">Сохранить ник</button>' +
+    '<div class="cl-saved" id="clSaved"></div>' +
+    '<button class="btn" id="clOut" style="background:#424242;margin-top:6px">Выйти из аккаунта</button>';
+  set.insertBefore(box, set.firstChild);
+  $('clAccMail').textContent = C.email() ? 'Вы вошли как ' + C.email() : 'Вы вошли в аккаунт';
+  $('clNickInp').value = C.nick();
+  $('clNickBtn').onclick = () => { if (C.setNick($('clNickInp').value)) showToast('Ник сохранён'); else showToast('Ник: минимум 2 символа'); };
+  $('clOut').onclick = () => { if (confirm('Выйти из аккаунта?')) C.signOut(); };
+  const savedTxt = () => { const t = C.lastSaved(); $('clSaved').textContent = t ? '☁ Сохранено в облаке в ' + new Date(t).toLocaleTimeString() : '☁ Данные сохраняются автоматически'; };
+  window.addEventListener('cloud-saved', savedTxt); savedTxt();
+  window.addEventListener('cloud-error', () => { $('clSaved').textContent = '⚠️ Не удалось сохранить в облако, пробую снова…'; });
 })();
 </script>
 
