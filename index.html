@@ -374,7 +374,10 @@
   window.Cloud = {
     ready: () => loaded, isNew: () => isNew, email: () => (S ? S.email : ''), nick: myNick,
     setNick: n => { n = String(n || '').trim().slice(0, 20); if (n.length < 2) return false; localStorage.setItem('sber_nick', n); heartbeat(); return true; },
-    lastSaved: () => lastSaved, flush: flushNow, signOut: signOut, heartbeat: heartbeat, listPlayers: listPlayers
+    lastSaved: () => lastSaved, flush: flushNow, signOut: signOut, heartbeat: heartbeat, listPlayers: listPlayers,
+    uid: () => (S ? S.uid : ''),
+    rpc: (fn, args) => rest('/rest/v1/rpc/' + fn, 'POST', JSON.stringify(args || {})),
+    get: path => rest('/rest/v1/' + path, 'GET')
   };
 })();
 </script>
@@ -4740,11 +4743,20 @@ mount(); setInterval(() => { const u = cu(); if (u) { if (scoreTick()) saveData(
 
 
 <style id="clUiCss">
-nav .nav-item { width: auto; flex: 1 1 0; min-width: 0; padding: 0 1px; }
+nav .nav-item { width: auto; flex: 1 1 0; min-width: 0; padding: 0 1px; position: relative; }
+.cl-badge { position: absolute; top: 0; left: 55%; min-width: 16px; height: 16px; border-radius: 8px; background: #ef4444; color: #fff; font-size: 10px; font-weight: 700; line-height: 16px; text-align: center; padding: 0 4px; }
+.cl-badge:empty, .cl-cnt:empty { display: none; }
+.cl-seg { display: flex; gap: 6px; background: var(--card-sub-bg); border-radius: 12px; padding: 4px; margin-bottom: 12px; }
+.cl-segb { flex: 1; border: 0; border-radius: 9px; padding: 9px 6px; font-size: 14px; font-weight: 700; background: transparent; color: var(--text-secondary); cursor: pointer; }
+.cl-segb.on { background: var(--sber-gradient); color: #fff; }
+.cl-cnt { display: inline-block; min-width: 18px; height: 18px; border-radius: 9px; background: #ef4444; color: #fff; font-size: 11px; line-height: 18px; padding: 0 5px; margin-left: 4px; }
 .cl-sum { font-size: 13px; color: var(--text-secondary); margin: 2px 0 6px; }
 .cl-grp { font-size: 12px; font-weight: 700; color: var(--text-secondary); text-transform: uppercase; letter-spacing: .04em; margin: 14px 2px 6px; }
 .cl-row { display: flex; align-items: center; gap: 12px; padding: 10px 12px; margin: 6px 0; border-radius: 14px; background: var(--card-sub-bg); border: 1px solid var(--border-color); }
+.cl-row.tap { cursor: pointer; }
+.cl-row.tap:active { filter: brightness(1.2); }
 .cl-av { width: 40px; height: 40px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 16px; color: #fff; background: #6b7280; flex: none; position: relative; }
+.cl-av.big { width: 52px; height: 52px; font-size: 20px; }
 .cl-av.on { background: var(--sber-gradient); }
 .cl-av.on::after { content: ''; position: absolute; right: -1px; bottom: -1px; width: 12px; height: 12px; border-radius: 50%; background: #22c55e; border: 2px solid var(--card-sub-bg); }
 .cl-main { flex: 1; min-width: 0; }
@@ -4753,18 +4765,38 @@ nav .nav-item { width: auto; flex: 1 1 0; min-width: 0; padding: 0 1px; }
 .cl-subt { font-size: 12px; color: var(--text-secondary); }
 .cl-st { font-size: 12px; color: var(--text-secondary); white-space: nowrap; text-align: right; }
 .cl-st.on { color: #22c55e; font-weight: 700; }
+.cl-acts { display: flex; gap: 6px; flex: none; }
+.cl-ib { border: 0; border-radius: 10px; min-width: 38px; height: 36px; padding: 0 10px; font-size: 14px; font-weight: 700; color: #fff; background: var(--sber-gradient); cursor: pointer; }
+.cl-ib.ghost { background: transparent; border: 1px solid var(--border-color); color: var(--text-color); }
 .cl-foot { font-size: 11px; color: var(--text-secondary); margin-top: 12px; text-align: center; }
+.cl-empty { font-size: 13px; color: var(--text-secondary); text-align: center; padding: 18px 8px; line-height: 1.4; }
 .cl-acc-mail { font-size: 13px; color: var(--text-secondary); margin-bottom: 12px; word-break: break-all; }
 .cl-saved { font-size: 12px; color: var(--text-secondary); margin: 8px 0 4px; }
+.cl-sheet-bg { position: fixed; inset: 0; z-index: 5000; background: rgba(0,0,0,.6); display: none; align-items: flex-end; justify-content: center; }
+.cl-sheet-bg.on { display: flex; }
+.cl-sheet { width: 100%; max-width: 480px; max-height: 90vh; overflow: auto; background: var(--card-bg); border: 1px solid var(--border-color); border-radius: 22px 22px 0 0; padding: 18px 16px 22px; }
+.cl-sheet * { box-sizing: border-box; }
+.cl-sh-head { display: flex; align-items: center; gap: 14px; margin-bottom: 14px; }
+.cl-sheet label { display: block; font-size: 12px; font-weight: 600; color: var(--text-secondary); margin: 12px 0 4px; }
+.cl-sheet input, .cl-sheet select { width: 100%; padding: 12px; font-size: 16px; border-radius: 12px; border: 1px solid var(--border-color); background: var(--input-bg); color: var(--text-color); outline: none; }
+.cl-sbtn { display: block; width: 100%; margin-top: 10px; padding: 13px; border: 0; border-radius: 12px; font-size: 15px; font-weight: 700; color: #fff; background: var(--sber-gradient); cursor: pointer; }
+.cl-sbtn.ghost { background: transparent; border: 1px solid var(--border-color); color: var(--text-color); }
+.cl-sbtn.danger { color: #ef4444; }
+.cl-sbtn:disabled { opacity: .55; cursor: default; }
+.cl-msg2 { min-height: 18px; font-size: 13px; margin-top: 10px; color: #ef4444; }
 </style>
 <script>
-/* ===== Аккаунт игрока: список игроков, выход, личный ПИН ===== */
+/* ===== Игроки, друзья, переводы, аккаунт ===== */
 (function () {
   'use strict';
   const C = window.Cloud;
   if (!C || !C.ready()) return;
   const $ = id => document.getElementById(id);
   const mk = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; };
+  // имена и тексты других игроков попадают в историю и уведомления игры как HTML — убираем опасные символы
+  const safe = (s, n) => String(s == null ? '' : s).replace(/[<>&"'`\\]/g, '').replace(/\s+/g, ' ').trim().slice(0, n || 20);
+  const money = n => (Math.round(n * 100) / 100).toLocaleString('ru-RU');
+  const mainId = () => usersData.user1 ? 'user1' : Object.keys(usersData)[0];
 
   /* 1. Новый игрок: его первый профиль называется по его нику */
   try {
@@ -4777,42 +4809,182 @@ nav .nav-item { width: auto; flex: 1 1 0; min-width: 0; padding: 0 1px; }
   const _cp = changePin; changePin = function () { const r = _cp.apply(this, arguments); pinHint(); return r; };
   pinHint();
 
-  /* 3. Вкладка «Игроки» — слева от «Настроек» */
+  /* 3. Вкладка «Игроки» (слева от «Настроек»): все игроки и друзья */
+  let view = 'all';
+  const D = { rows: [], rel: {}, err: null, friendsOk: true, ready: false };
   const tab = mk('div', 'tab-content'); tab.id = 'tab-players';
-  tab.innerHTML = '<div class="box"><div class="box-title">👥 Список игроков</div><div class="cl-sum" id="plSum">Загрузка…</div><div id="plList"></div>' +
-    '<div class="cl-foot">Обновляется автоматически. «В сети» — игрок открыл игру прямо сейчас.</div></div>';
+  tab.innerHTML = '<div class="box"><div class="box-title">👥 Игроки</div>' +
+    '<div class="cl-seg"><button class="cl-segb on" data-v="all">Все игроки</button><button class="cl-segb" data-v="friends">Друзья<span class="cl-cnt" id="clFrCnt"></span></button></div>' +
+    '<div class="cl-sum" id="plSum">Загрузка…</div><div id="plList"></div>' +
+    '<div class="cl-foot" id="plFoot">Нажмите на игрока, чтобы добавить его в друзья или перевести деньги. «В сети» — игра открыта прямо сейчас.</div></div>';
   $('tab-settings').before(tab);
   const nb = mk('button', 'nav-item'); nb.dataset.tab = 'players'; nb.setAttribute('onclick', "switchTab('players',this)");
   nb.innerHTML = '<span class="nav-icon">👥</span><span>Игроки</span>';
+  const badge = mk('span', 'cl-badge'); nb.appendChild(badge);
   document.querySelector('nav .nav-item[data-tab="settings"]').before(nb);
 
+  const relOf = p => (D.rel[p.id] && D.rel[p.id].rel) || null;
   const agoText = s => s < 3600 ? Math.max(1, Math.floor(s / 60)) + ' мин назад' : s < 86400 ? Math.floor(s / 3600) + ' ч назад' : Math.floor(s / 86400) + ' дн. назад';
-  function row(p) {
-    const d = mk('div', 'cl-row'), av = mk('div', 'cl-av' + (p.online ? ' on' : ''), (p.name.trim().charAt(0) || '?').toUpperCase());
+  const relTag = p => { const r = relOf(p); return r === 'friend' ? ' · друг' : r === 'incoming' ? ' · хочет дружить' : r === 'outgoing' ? ' · заявка отправлена' : ''; };
+
+  function load() {
+    return Promise.all([C.listPlayers(), C.get('friendships?select=id,a,b,status&order=id.asc')]).then(res => {
+      const pl = res[0], fr = res[1];
+      if (pl.error != null) { D.err = pl.error; return; }
+      D.err = null; D.rows = pl.rows; D.rel = {}; D.friendsOk = fr.ok; D.ready = true;
+      const me = C.uid();
+      if (fr.ok && Array.isArray(fr.json)) fr.json.forEach(f => {
+        const other = f.a === me ? f.b : f.a;
+        D.rel[other] = { fid: f.id, rel: f.status === 'accepted' ? 'friend' : (f.a === me ? 'outgoing' : 'incoming') };
+      });
+    }).catch(() => {});
+  }
+
+  function row(p, actions) {
+    const d = mk('div', 'cl-row' + (p.me ? '' : ' tap'));
+    d.appendChild(mk('div', 'cl-av' + (p.online ? ' on' : ''), (p.name.trim().charAt(0) || '?').toUpperCase()));
     const m = mk('div', 'cl-main'), nm = mk('div', 'cl-name', p.name);
     if (p.me) nm.appendChild(mk('span', 'cl-me', 'вы'));
-    m.appendChild(nm); m.appendChild(mk('div', 'cl-subt', 'Уровень ' + p.level));
-    d.appendChild(av); d.appendChild(m); d.appendChild(mk('div', 'cl-st' + (p.online ? ' on' : ''), p.online ? '● В сети' : agoText(p.ago)));
+    m.appendChild(nm); m.appendChild(mk('div', 'cl-subt', 'Уровень ' + p.level + relTag(p)));
+    d.appendChild(m);
+    if (actions) {
+      const a = mk('div', 'cl-acts');
+      actions.forEach(x => { const b = mk('button', 'cl-ib ' + (x.cls || ''), x.label); b.onclick = e => { e.stopPropagation(); x.fn(); }; a.appendChild(b); });
+      d.appendChild(a);
+    } else d.appendChild(mk('div', 'cl-st' + (p.online ? ' on' : ''), p.online ? '● В сети' : agoText(p.ago)));
+    if (!p.me) d.onclick = () => openSheet(p);
     return d;
   }
-  function render(res) {
+  function group(list, title, items, actionsFn) {
+    if (!items.length) return;
+    list.appendChild(mk('div', 'cl-grp', title + ' · ' + items.length));
+    items.forEach(p => list.appendChild(row(p, actionsFn ? actionsFn(p) : null)));
+  }
+  function render() {
     const list = $('plList'), sum = $('plSum'); list.textContent = '';
-    if (res.error != null) {
-      sum.textContent = (res.error === 404 || res.error === 400) ? 'Список игроков ещё не настроен в базе (выполните SQL из инструкции).' : 'Не удалось загрузить список (код ' + res.error + ').';
+    const inc = D.rows.filter(p => relOf(p) === 'incoming').length;
+    badge.textContent = inc ? String(inc) : ''; $('clFrCnt').textContent = inc ? String(inc) : '';
+    if (!D.ready && D.err == null) { sum.textContent = 'Загрузка…'; return; }
+    if (D.err != null) {
+      sum.textContent = (D.err === 404 || D.err === 400) ? 'Список игроков ещё не настроен в базе (выполните SQL из инструкции).' : 'Не удалось загрузить список (код ' + D.err + ').';
       return;
     }
-    const on = res.rows.filter(p => p.online), off = res.rows.filter(p => !p.online);
-    sum.textContent = 'В сети: ' + on.length + ' · Не в сети: ' + off.length;
-    if (on.length) { list.appendChild(mk('div', 'cl-grp', 'В сети · ' + on.length)); on.forEach(p => list.appendChild(row(p))); }
-    if (off.length) { list.appendChild(mk('div', 'cl-grp', 'Не в сети · ' + off.length)); off.forEach(p => list.appendChild(row(p))); }
+    if (view === 'all') {
+      const on = D.rows.filter(p => p.online), off = D.rows.filter(p => !p.online);
+      sum.textContent = 'В сети: ' + on.length + ' · Не в сети: ' + off.length;
+      group(list, 'В сети', on); group(list, 'Не в сети', off);
+      return;
+    }
+    if (!D.friendsOk) { sum.textContent = 'Друзья ещё не настроены в базе (выполните SQL из инструкции).'; return; }
+    const incoming = D.rows.filter(p => relOf(p) === 'incoming'), outgoing = D.rows.filter(p => relOf(p) === 'outgoing'),
+          friends = D.rows.filter(p => relOf(p) === 'friend'), fOn = friends.filter(p => p.online), fOff = friends.filter(p => !p.online);
+    sum.textContent = 'Друзей: ' + friends.length + ' · в сети: ' + fOn.length;
+    group(list, 'Заявки в друзья', incoming, p => [{ label: '✓', fn: () => respond(p, true) }, { label: '✕', cls: 'ghost', fn: () => respond(p, false) }]);
+    group(list, 'Друзья в сети', fOn); group(list, 'Друзья не в сети', fOff);
+    group(list, 'Отправленные заявки', outgoing, p => [{ label: 'Отменить', cls: 'ghost', fn: () => removeFriend(p) }]);
+    if (!incoming.length && !friends.length && !outgoing.length) list.appendChild(mk('div', 'cl-empty', 'Друзей пока нет. Откройте «Все игроки», нажмите на игрока и выберите «Добавить в друзья».'));
   }
-  let plBusy = false;
-  function refreshPlayers() {
-    if (plBusy) return; plBusy = true;
-    C.heartbeat().then(() => C.listPlayers()).then(render).then(() => { plBusy = false; }, () => { plBusy = false; });
+  function refresh() { return load().then(render); }
+  tab.querySelectorAll('.cl-segb').forEach(b => { b.onclick = () => { view = b.dataset.v; tab.querySelectorAll('.cl-segb').forEach(x => x.classList.toggle('on', x === b)); render(); }; });
+  nb.addEventListener('click', () => { render(); C.heartbeat().then(refresh); });
+
+  /* дружба */
+  const frMsg = { sent: 'Заявка отправлена', accepted: 'Вы теперь друзья! 🎉', friends: 'Вы уже друзья', limit: 'Слишком много неотвеченных заявок', error: 'Не получилось отправить заявку' };
+  const needSql = r => { if (!r.ok) showToast(r.status === 404 ? 'Друзья не настроены в базе (SQL из инструкции)' : 'Не получилось, попробуйте ещё раз'); return r.ok; };
+  function addFriend(p) { return C.rpc('friend_request', { p_to: p.id }).then(r => { if (needSql(r)) showToast(frMsg[r.json] || frMsg.error); }).then(refresh); }
+  function respond(p, ok) { return C.rpc('friend_respond', { p_from: p.id, p_accept: ok }).then(r => { if (needSql(r)) showToast(ok ? 'Вы теперь друзья! 🎉' : 'Заявка отклонена'); }).then(refresh); }
+  function removeFriend(p) { return C.rpc('friend_remove', { p_other: p.id }).then(r => { if (needSql(r)) showToast('Готово'); }).then(refresh); }
+
+  /* карточка игрока (нижнее окно): друзья и перевод */
+  const bg = mk('div', 'cl-sheet-bg'); bg.id = 'clSheetBg'; const sh = mk('div', 'cl-sheet'); bg.appendChild(sh); document.body.appendChild(bg);
+  const closeSheet = () => bg.classList.remove('on');
+  bg.addEventListener('click', e => { if (e.target === bg) closeSheet(); });
+  function btn(label, cls, fn) { const b = mk('button', 'cl-sbtn ' + (cls || ''), label); b.onclick = fn; return b; }
+  function head(p) {
+    const h = mk('div', 'cl-sh-head'); h.appendChild(mk('div', 'cl-av big' + (p.online ? ' on' : ''), (p.name.trim().charAt(0) || '?').toUpperCase()));
+    const m = mk('div'); m.appendChild(mk('div', 'cl-name', p.name)); m.appendChild(mk('div', 'cl-subt', 'Уровень ' + p.level + ' · ' + (p.online ? 'в сети' : agoText(p.ago)) + relTag(p))); h.appendChild(m); return h;
   }
-  nb.addEventListener('click', refreshPlayers);
-  setInterval(() => { if (tab.classList.contains('active') && document.visibilityState === 'visible') refreshPlayers(); }, 15000);
+  function openSheet(p) {
+    sh.textContent = ''; sh.appendChild(head(p)); const rel = relOf(p);
+    sh.appendChild(btn('💸 Перевести деньги', '', () => openSend(p)));
+    if (rel === 'incoming') { sh.appendChild(btn('✅ Принять заявку в друзья', '', () => { closeSheet(); respond(p, true); })); sh.appendChild(btn('Отклонить заявку', 'ghost', () => { closeSheet(); respond(p, false); })); }
+    else if (rel === 'outgoing') sh.appendChild(btn('⏳ Заявка отправлена — отменить', 'ghost', () => { closeSheet(); removeFriend(p); }));
+    else if (rel === 'friend') sh.appendChild(btn('Удалить из друзей', 'ghost danger', () => { if (confirm('Удалить ' + p.name + ' из друзей?')) { closeSheet(); removeFriend(p); } }));
+    else sh.appendChild(btn('➕ Добавить в друзья', 'ghost', () => { closeSheet(); addFriend(p); }));
+    sh.appendChild(btn('Закрыть', 'ghost', closeSheet));
+    bg.classList.add('on');
+  }
+
+  /* перевод игроку: сначала списываем у себя и сохраняем, потом отправляем; не вышло — возвращаем деньги */
+  function openSend(p) {
+    sh.textContent = ''; sh.appendChild(head(p));
+    const u = usersData[currentUserId], cards = ((u && u.cards) || []).filter(c => !c.frozen && !c.blocked);
+    if (!cards.length) { sh.appendChild(mk('div', 'cl-msg2', 'Нет доступных карт: разморозьте или перевыпустите карту на главной.')); sh.appendChild(btn('Назад', 'ghost', () => openSheet(p))); return; }
+    const sel = document.createElement('select'); sel.id = 'clSendCard';
+    cards.forEach(c => { const o = document.createElement('option'); o.value = c.id; o.textContent = c.name + ' (' + money(c.balance) + ' ₽)'; sel.appendChild(o); });
+    const amt = document.createElement('input'); amt.type = 'number'; amt.id = 'clSendAmt'; amt.inputMode = 'decimal'; amt.min = '1'; amt.step = 'any'; amt.placeholder = '0 ₽';
+    const note = document.createElement('input'); note.type = 'text'; note.id = 'clSendNote'; note.maxLength = 60; note.placeholder = 'Например: за обед';
+    const msg = mk('div', 'cl-msg2'); msg.id = 'clSendMsg';
+    const go = btn('Перевести', '', () => doSend(p, parseFloat(sel.value), parseFloat(String(amt.value).replace(',', '.')), safe(note.value, 60), msg, go));
+    [mk('label', null, 'С карты'), sel, mk('label', null, 'Сумма (₽)'), amt, mk('label', null, 'Сообщение (необязательно)'), note, msg, go, btn('Назад', 'ghost', () => openSheet(p))].forEach(e => sh.appendChild(e));
+    bg.classList.add('on');
+  }
+  async function doSend(p, cardId, amt, note, msg, go) {
+    const uid = currentUserId, u = usersData[uid], card = u && u.cards.find(c => c.id === cardId);
+    if (!card || card.frozen || card.blocked) { msg.textContent = 'Эта карта недоступна.'; return; }
+    if (!(amt >= 1) || amt > 1e9) { msg.textContent = 'Минимальная сумма — 1 ₽.'; return; }
+    amt = Math.round(amt * 100) / 100;
+    if (card.balance < amt) { msg.textContent = 'Недостаточно средств на карте.'; return; }
+    go.disabled = true; msg.style.color = 'var(--text-secondary)'; msg.textContent = 'Отправляю…';
+    const title = 'Перевод: ' + safe(p.name);
+    card.balance -= amt;
+    addHistoryToUser(uid, title, amt, false, note ? 'Сообщение: ' + note : '');
+    saveData(); updateUI();
+    let ok = false;
+    try { if (await C.flush()) { const r = await C.rpc('send_transfer', { p_to: p.id, p_amount: amt, p_note: note }); ok = r.ok && typeof r.json === 'number'; } } catch (e) {}
+    if (ok) { showToast('Отправлено ' + money(amt) + ' ₽ игроку ' + safe(p.name)); closeSheet(); return; }
+    const c2 = usersData[uid] && usersData[uid].cards.find(c => c.id === cardId); if (c2) c2.balance += amt;
+    const h = usersData[uid] && usersData[uid].history;
+    if (h && h[0] && h[0].title === title && h[0].amount === amt && h[0].isPlus === false) h.shift();
+    saveData(); updateUI();
+    msg.style.color = '#ef4444'; msg.textContent = 'Не удалось отправить — деньги возвращены на карту.'; go.disabled = false;
+  }
+
+  /* входящие переводы: зачисляем на первую карту основного профиля, запоминаем номера, затем подтверждаем получение */
+  let recvBusy = false;
+  const loadApplied = () => { try { return new Set(JSON.parse(localStorage.getItem('sber_tx_applied') || '[]')); } catch (e) { return new Set(); } };
+  async function receiveTransfers() {
+    if (recvBusy) return; recvBusy = true;
+    try {
+      const r = await C.get('transfers?select=id,from_name,amount,note&to_id=eq.' + encodeURIComponent(C.uid()) + '&received_at=is.null&order=id.asc&limit=50');
+      if (!r.ok || !Array.isArray(r.json) || !r.json.length) return;
+      const mid = mainId(), main = usersData[mid], card = main && main.cards && (main.cards.find(c => c.type !== 'credit') || main.cards[0]);
+      if (!card) return;
+      const applied = loadApplied(), fresh = r.json.filter(t => !applied.has(t.id));
+      fresh.forEach(t => {
+        const a = Math.round((+t.amount || 0) * 100) / 100; if (!(a > 0)) { applied.add(t.id); return; }
+        card.balance += a; applied.add(t.id);
+        addHistoryToUser(mid, 'Перевод от: ' + safe(t.from_name), a, true, t.note ? 'Сообщение: ' + safe(t.note, 60) : '');
+        showPush('Перевод', safe(t.from_name) + ' перевёл(а) вам ' + money(a) + ' ₽' + (t.note ? ': ' + safe(t.note, 60) : ''));
+      });
+      if (fresh.length) { localStorage.setItem('sber_tx_applied', JSON.stringify(Array.from(applied).slice(-300))); saveData(); updateUI(); }
+      if (!(await C.flush())) return;          // сначала убеждаемся, что зачисление сохранено в облаке
+      await C.rpc('ack_transfers', { p_ids: r.json.map(t => t.id) });
+    } catch (e) { console.warn(e); } finally { recvBusy = false; }
+  }
+
+  /* опрос: новые заявки, переводы */
+  let first = true; const seenIncoming = new Set();
+  function tick() {
+    if (document.visibilityState === 'hidden') return;
+    load().then(() => {
+      D.rows.filter(p => relOf(p) === 'incoming').forEach(p => { if (!first && !seenIncoming.has(p.id)) showPush('Друзья', safe(p.name) + ' хочет добавить вас в друзья'); seenIncoming.add(p.id); });
+      first = false; render();
+    });
+    receiveTransfers();
+  }
+  setInterval(tick, 20000); setTimeout(tick, 1500);
+  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') tick(); });
 
   /* 4. Блок «Аккаунт» вверху настроек */
   const set = $('tab-settings'), box = mk('div', 'box'); box.id = 'clAccount';
