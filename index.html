@@ -377,7 +377,8 @@
     lastSaved: () => lastSaved, flush: flushNow, signOut: signOut, heartbeat: heartbeat, listPlayers: listPlayers,
     uid: () => (S ? S.uid : ''),
     rpc: (fn, args) => rest('/rest/v1/rpc/' + fn, 'POST', JSON.stringify(args || {})),
-    get: path => rest('/rest/v1/' + path, 'GET')
+    get: path => rest('/rest/v1/' + path, 'GET'),
+    fn: (name, body) => rest('/functions/v1/' + name, 'POST', JSON.stringify(body || {}))
   };
 })();
 </script>
@@ -4928,7 +4929,7 @@ nav .nav-item { width: auto; flex: 1 1 0; min-width: 0; padding: 0 1px; position
   /* нажатие на своё имя: стать админом / открыть панель */
   function openSelf(p) {
     sh.textContent = ''; sh.classList.remove('chat'); sh.appendChild(head(p));
-    if (!isAdmin) sh.appendChild(btn('🛡 Стать админом', '', () => askAdminPass(p)));
+    if (!isAdmin) { sh.appendChild(btn('📨 Запросить права админа', '', () => requestAdmin(p))); sh.appendChild(btn('🛡 Стать админом (по паролю)', 'ghost', () => askAdminPass(p))); }
     else { sh.appendChild(btn('🛠 Открыть админ-панель', '', () => { closeSheet(); showView('admin'); })); sh.appendChild(btn('Снять права админа', 'ghost danger', resign)); }
     sh.appendChild(btn('Закрыть', 'ghost', closeSheet)); bg.classList.add('on');
   }
@@ -4951,6 +4952,35 @@ nav .nav-item { width: auto; flex: 1 1 0; min-width: 0; padding: 0 1px; position
     bg.classList.add('on');
   }
   function setAdmin(v) { isAdmin = !!v; $('clAdmSeg').style.display = isAdmin ? '' : 'none'; if (!isAdmin && view === 'admin') showView('all'); }
+  function requestAdmin(p) {
+    C.fn('admin-request', {}).then(r => {
+      const st = r.ok && r.json && r.json.status;
+      if (st === 'sent') showToast('Заявка отправлена владельцу. Ждите решения 📨');
+      else if (st === 'pending') showToast('Заявка уже на рассмотрении ⏳');
+      else if (st === 'wait') showToast('Новую заявку можно отправить через 10 минут');
+      else if (st === 'already') { setAdmin(true); showToast('Вы уже администратор'); }
+      else showToast(r.status === 404 ? 'Заявки не настроены в Supabase (см. инструкцию)' : 'Не получилось отправить заявку');
+      closeSheet();
+    });
+  }
+  let adminReady = false;
+  function adminState() {
+    C.get('admins?select=id&id=eq.' + encodeURIComponent(me())).then(r => {
+      if (!r.ok || !Array.isArray(r.json)) return;
+      const has = r.json.length > 0;
+      if (has && !isAdmin && adminReady) showToast('Вам выдали права админа 🛠');
+      if (has && !isAdmin) setAdmin(true);
+      if (!has && isAdmin) setAdmin(false);
+      adminReady = true;
+    });
+    C.get('admin_requests?select=id,status&user_id=eq.' + encodeURIComponent(me()) + '&order=id.desc&limit=1').then(r => {
+      const x = r.ok && Array.isArray(r.json) && r.json[0];
+      if (x && x.status === 'denied') {
+        const seen = loadSet('cl_req_seen');
+        if (!seen.has(x.id)) { seen.add(x.id); saveSet('cl_req_seen', seen); showToast('Заявка на права админа отклонена'); }
+      }
+    });
+  }
   function resign() { C.rpc('admin_resign', {}).then(r => { if (r.ok) { setAdmin(false); closeSheet(); showToast('Права админа сняты'); } else showToast('Не получилось'); }); }
 
   /* перевод игроку: сначала списываем у себя и сохраняем, потом отправляем; не вышло — возвращаем деньги */
@@ -5259,7 +5289,7 @@ nav .nav-item { width: auto; flex: 1 1 0; min-width: 0; padding: 0 1px; position
       D.rows.filter(p => relOf(p) === 'incoming').forEach(p => { if (!first && !seenIncoming.has(p.id)) showPush('Друзья', safe(p.name) + ' хочет добавить вас в друзья'); seenIncoming.add(p.id); });
       first = false; render();
     });
-    receiveTransfers(); receiveCmds(); dmPoll();
+    receiveTransfers(); receiveCmds(); dmPoll(); adminState();
   }
   setInterval(tick, 20000); setTimeout(tick, 1500);
   document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') tick(); });
